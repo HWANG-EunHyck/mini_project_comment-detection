@@ -1,0 +1,222 @@
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from tqdm.notebook import tqdm
+import pandas as pd
+
+import gluonnlp as nlp
+
+from kobert import get_tokenizer
+from kobert import get_pytorch_kobert_model
+
+from transformers import AdamW
+from transformers.optimization import get_cosine_schedule_with_warmup
+from sklearn.model_selection import train_test_split
+
+data = pd.read_excel("data/toxic.xlsx")
+bertmodel, vocab = get_pytorch_kobert_model(cachedir=".cache")
+
+Vocab(size=8002, unk="[UNK]", reserved="['[CLS]', '[SEP]', '[MASK]', '[PAD]']")
+
+train, test = train_test_split(data, test_size=0.2, random_state=777)
+
+tokenizer = get_tokenizer() #토크나이저 변수 설정
+tok = nlp.data.BERTSPTokenizer(tokenizer, vocab, lower=False) #BERT 토크나이저 설정
+
+#BERT 데이터셋 구축 클래스
+class BERTDataset(Dataset):
+    #init method에서는 클래스에서의 공통 변수를 설정
+    def __init__(self, dataset, sent_idx, label_idx, bert_tokenizer, max_len,
+                 pad, pair):
+        #BERT 토크나이저를 적용
+        transform = nlp.data.BERTSentenceTransform(
+            bert_tokenizer, max_seq_length=max_len, pad=pad, pair=pair)
+        self.sentences = [transform([i[sent_idx]]) for i in dataset]
+        self.labels = [np.int32(i[label_idx]) for i in dataset]
+
+    #데이터 확인 메소드
+    def __getitem__(self, i):
+        return (self.sentences[i] + (self.labels[i], ))
+
+    #클래스 개수 확인 메소드
+    def __len__(self):
+        return (len(self.labels))
+
+## Setting parameters
+max_len = 100 #단어 길이
+batch_size = 32 #
+warmup_ratio = 0.1
+num_epochs = 1
+max_grad_norm = 1
+log_interval = 10
+learning_rate =  5e-5
+
+dataset_train = train[["Toxic Comment", "악성댓글여부"]]
+dataset_test = test[["Toxic Comment", "악성댓글여부"]]
+
+#BERT 모델에 입력하기 위한 전처리
+dataset_train.columns = [0, 1]
+dataset_test.columns = [0, 1]
+dataset_train = dataset_train.reset_index(drop=True)
+dataset_test = dataset_test.reset_index(drop=True)
+dataset_train[0] = dataset_train[0].str.replace("\n", "")
+dataset_test[0] = dataset_test[0].str.replace("\n", "")
+
+#tsv파일 내보내기
+dataset_train.to_csv("dataset_train.tsv", sep='\t', header = None)
+dataset_test.to_csv("dataset_test.tsv", sep='\t', header = None)
+
+dataset_train = nlp.data.TSVDataset("dataset_train.tsv", field_indices=[1,2])
+dataset_test = nlp.data.TSVDataset("dataset_test.tsv", field_indices=[1,2])
+
+#BERT Train, Test 데이터 만들기
+data_train = BERTDataset(dataset_train, 0, 1, tok, max_len, True, False)
+data_test = BERTDataset(dataset_test, 0, 1, tok, max_len, True, False)
+
+#train, test셋 생성
+train_dataloader = torch.utils.data.DataLoader(data_train, batch_size=batch_size, num_workers=5)
+test_dataloader = torch.utils.data.DataLoader(data_test, batch_size=batch_size, num_workers=5)
+
+#분류기 만들기, 모델 설정
+class BERTClassifier(nn.Module):
+    def __init__(self,
+                 bert,
+                 hidden_size = 768,
+                 num_classes=2,   ##클래스 수 조정##
+                 dr_rate=None,
+                 params=None):
+        super(BERTClassifier, self).__init__()
+        self.bert = bert
+        self.dr_rate = dr_rate
+
+        self.classifier = nn.Linear(hidden_size , num_classes)
+        if dr_rate:
+            self.dropout = nn.Dropout(p=dr_rate)
+
+    def gen_attention_mask(self, token_ids, valid_length):
+        attention_mask = torch.zeros_like(token_ids)
+        for i, v in enumerate(valid_length):
+            attention_mask[i][:v] = 1
+        return attention_mask.float()
+
+    def forward(self, token_ids, valid_length, segment_ids):
+        attention_mask = self.gen_attention_mask(token_ids, valid_length)
+
+        _, pooler = self.bert(input_ids = token_ids, token_type_ids = segment_ids.long(), attention_mask = attention_mask.float().to(token_ids.device),return_dict=False)
+        if self.dr_rate:
+            out = self.dropout(pooler)
+        return self.classifier(out)
+
+model = BERTClassifier(bertmodel, dr_rate=0.5).to(device)
+
+#학습률 최적화 하이퍼 파라미터
+no_decay = ['bias', 'LayerNorm.weight']
+optimizer_grouped_parameters = [
+    {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+    {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+]
+
+#로스 최적화 함수
+optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
+#실제값과 예측값 분포 차이
+loss_fn = nn.CrossEntropyLoss()
+
+t_total = len(train_dataloader) * num_epochs
+warmup_step = int(t_total * warmup_ratio)
+
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_step, num_training_steps=t_total)
+
+
+#학습하면서 성능 지표 확인
+def metric(logit, label, threshold=0.5, beta=2):
+    max_vals, prob = torch.max(logit, 1)
+    label = label > threshold
+    TP = (prob & label).sum().float().data.cpu()
+    TN = ((~prob) & (~label)).sum().float().data.cpu()
+    FP = (prob & (~label)).sum().float().data.cpu()
+    FN = ((~prob) & label).sum().float().data.cpu()
+    accuracy = (TP+TN)/(TP+TN+FP+FN)
+    precision = torch.mean(TP / (TP + FP + 1e-12))
+    recall = torch.mean(TP / (TP + FN + 1e-12))
+    F2 = (1 + beta**2) * precision * recall / (beta**2 * precision + recall + 1e-12)
+    return accuracy, precision, recall, F2.mean(0)
+
+#모델 학습
+#pytorch 학습 방식, 학습 로직 설계를 위해서 반복문을 활용
+for e in range(num_epochs):
+    test_acc = 0.0
+    test_recall = 0.0
+    test_precision = 0.0
+    test_f1score = 0.0
+
+    model.train() #모델 학습
+    for batch_id, (token_ids, valid_length, segment_ids, label) in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
+        optimizer.zero_grad()
+        token_ids = token_ids.long().to(device)
+        segment_ids = segment_ids.long().to(device)
+        valid_length= valid_length
+        label = label.long().to(device)
+        out = model(token_ids, valid_length, segment_ids)
+        loss = loss_fn(out, label)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        scheduler.step()  # Update learning rate schedule
+        if batch_id % log_interval == 0:
+            print("epoch {} batch id {} loss {}".format(e+1, batch_id+1, loss.data.cpu().numpy()))
+
+    model.eval() #모델 검증
+    for batch_id, (token_ids, valid_length, segment_ids, label) in tqdm(enumerate(test_dataloader), total=len(test_dataloader)):
+        token_ids = token_ids.long().to(device)
+        segment_ids = segment_ids.long().to(device)
+        valid_length= valid_length
+        label = label.long().to(device)
+        out = model(token_ids, valid_length, segment_ids)
+        accuracy, precision, recall, F1_score = metric(out.squeeze(), label.float())
+        test_acc += accuracy
+        test_recall += recall
+        test_precision += precision
+        test_f1score += F1_score
+    print("epoch {} test acc {}".format(e+1, test_acc / (batch_id+1)))
+    print("epoch {} test recall {}".format(e+1, test_recall / (batch_id+1)))
+    print("epoch {} test precision {}".format(e+1, test_precision / (batch_id+1)))
+    print("epoch {} test f1score {}".format(e+1, test_f1score / (batch_id+1)))
+   # torch.cuda.empty_cache()
+
+#토큰화
+def predict(predict_sentence):
+
+    data = [predict_sentence, '0']
+    dataset_another = [data]
+
+    another_test = BERTDataset(dataset_another, 0, 1, tok, max_len, True, False)
+    test_dataloader = torch.utils.data.DataLoader(another_test, batch_size=batch_size, num_workers=5)
+
+    model.eval()
+
+    for batch_id, (token_ids, valid_length, segment_ids, label) in enumerate(test_dataloader):
+        token_ids = token_ids.long().to(device)
+        segment_ids = segment_ids.long().to(device)
+
+        valid_length= valid_length
+        label = label.long().to(device)
+
+        out = model(token_ids, valid_length, segment_ids)
+
+        test_eval=[]
+        for i in out:
+            logits=i
+            logits = logits.detach().cpu().numpy()
+
+            if np.argmax(logits) == 0:
+                test_eval.append("정상 댓글이")
+            elif np.argmax(logits) == 1:
+                test_eval.append("악성 댓글이")
+            else:
+              print("Error! Error! Error! Error! ")
+
+        print(">> 입력하신 내용에서 " + test_eval[0] + " 탐지됩니다.")
+
